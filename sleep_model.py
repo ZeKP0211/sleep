@@ -9,8 +9,8 @@ class EnvQualityClassifier(nn.Module):
 
     该模型同时输出：
       - 舒适度分数（0-1）
-      - 各项风险概率（如过热、过冷、气味不适）
-      - 分类环境质量
+      - 风险类别概率（无风险、过热、过冷、气味不适）
+      - 环境质量分类（优、良、中、差）
     """
 
     def __init__(
@@ -19,8 +19,8 @@ class EnvQualityClassifier(nn.Module):
         odor_vocab_size: int = 5,  # 气味类别数（薰衣草、沉香、川芎、无等）
         odor_emb_dim: int = 4,  #将每种气味映射为一个长度为 4 的向量
         hidden_dim: int = 64,   #共享层中的隐藏单元数
-        risk_dim: int = 3,  #评估 3 种风险（过热、过冷、气味不适）
-        num_classes: int = 4,   #传统单分类任务的类别数量（将环境质量分为：优、良、中、差 
+        risk_dim: int = 4,  #4 类风险（无风险、过热、过冷、气味不适），与标签 0-3 对齐
+        num_classes: int = 4,   #传统单分类任务的类别数量（将环境质量分为：优、良、中、差
     ):
         super().__init__()
         self.odor_embedding = nn.Embedding(odor_vocab_size, odor_emb_dim)
@@ -296,7 +296,7 @@ def build_models() -> dict:
             odor_vocab_size=5,
             odor_emb_dim=4,
             hidden_dim=64,
-            risk_dim=3,
+            risk_dim=4,
             num_classes=4,
         ),
         "sleep_impact_predictor": SleepImpactPredictor(

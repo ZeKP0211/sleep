@@ -5,19 +5,20 @@ import torch.nn.functional as F
 def env_quality_loss(
     outputs: dict[str, torch.Tensor],
     labels: torch.Tensor,
-    risk_targets: torch.Tensor | None = None,
     comfort_targets: torch.Tensor | None = None,
     class_weight: float = 1.0,
     risk_weight: float = 1.0,
     comfort_weight: float = 1.0,
 ) -> torch.Tensor:
-    """多任务环境质量损失。"""
+    """多任务环境质量损失。
+
+    risk_logits 与 class_logits 共享相同标签（0=无风险/舒适,1=过热,2=过冷,3=气味不适），
+    均使用交叉熵损失。risk_head 与 class_head 从共享表征中学习不同视角。
+    """
     loss = class_weight * F.cross_entropy(outputs["class_logits"], labels)
 
-    if risk_targets is not None and "risk_logits" in outputs:
-        loss = loss + risk_weight * F.binary_cross_entropy_with_logits(
-            outputs["risk_logits"], risk_targets
-        )
+    if "risk_logits" in outputs:
+        loss = loss + risk_weight * F.cross_entropy(outputs["risk_logits"], labels)
 
     if comfort_targets is not None and "comfort_score" in outputs:
         loss = loss + comfort_weight * F.mse_loss(

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 预测脚本：使用训练好的模型进行推理
-支持单样本预测和批量评估
+支持单样本预测、批量评估、可读结果输出
 """
 
 import argparse
 import logging
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -21,6 +21,138 @@ from sleep_model import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+# ──────────────────────────── 可读结果格式化 ────────────────────────────
+
+# 映射字典与 sleep_model.py 参数注释严格对齐
+# sleep_model.py L23: num_classes=4 → 优、良、中、差
+_CLASS_LABELS = ["优", "良", "中", "差"]
+# sleep_model.py L22: risk_dim=4 → 无风险、过热、过冷、气味不适（与标签 0-3 对齐）
+_RISK_LABELS = ["无风险", "过热风险", "过冷风险", "气味不适风险"]
+# sleep_model.py L309: output_dim=6
+_SLEEP_METRIC_LABELS = [
+    "睡眠效率",
+    "入睡潜伏期",
+    "深睡时长",
+    "觉醒次数",
+    "呼吸暂停低通气指数",
+    "主观睡眠质量",
+]
+_SLEEP_METRIC_UNITS = ["%", "分钟", "小时", "次", "", "分"]
+# sleep_model.py L314: discrete_action_dim=3 → 开/关香薰，开/关空调，开/关风扇
+_DISCRETE_ACTION_LABELS = ["香薰开关", "空调开关", "风扇开关"]
+# sleep_model.py L315: continuous_action_dim=2 → 温度调节幅度，湿度调节幅度
+_CONTINUOUS_ACTION_LABELS = ["温度调节幅度", "湿度调节幅度"]
+
+
+def _format_env_quality(results: Dict[str, np.ndarray]) -> List[str]:
+    """格式化环境质量预测结果为可读文本。"""
+    lines: List[str] = []
+    # class_pred
+    for i in range(len(results["class_pred"])):
+        cls_idx = int(results["class_pred"][i])
+        label = _CLASS_LABELS[cls_idx] if 0 <= cls_idx < len(_CLASS_LABELS) else f"未知({cls_idx})"
+        lines.append(f"环境质量分类：{label}")
+
+    # comfort
+    for i, c in enumerate(results["comfort"].flatten()):
+        desc = "高" if c >= 0.7 else ("中" if c >= 0.4 else "低")
+        lines.append(f"舒适度：{c:.2%}（{desc}）")
+
+    # risk_probs（4 类 softmax：无风险、过热、过冷、气味不适）
+    risk_probs = results["risk_probs"]
+    for i in range(risk_probs.shape[0]):
+        risks = [f"{_RISK_LABELS[j]}{risk_probs[i, j]:.1%}" for j in range(risk_probs.shape[1])]
+        lines.append(f"风险概率：{'，'.join(risks)}")
+
+    # class_probs
+    class_probs = results["class_probs"]
+    for i in range(class_probs.shape[0]):
+        probs = [f"{_CLASS_LABELS[j]}{class_probs[i, j]:.1%}" for j in range(class_probs.shape[1])]
+        lines.append(f"分类概率：{'，'.join(probs)}")
+
+    return lines
+
+
+def _fmt(val: float, unit: str) -> str:
+    """数值转可读字符串，带单位。"""
+    if unit == "%":
+        return f"{val * 100:.1f}%"
+    if unit == "分钟":
+        return f"{val:.0f}分钟"
+    if unit == "小时":
+        return f"{val:.1f}小时"
+    if unit == "次":
+        return f"{val:.0f}次"
+    if unit == "分":
+        return f"{val:.2f}分"
+    return f"{val:.4f}"
+
+
+def _format_sleep_impact(predictions: np.ndarray) -> List[str]:
+    """格式化睡眠影响预测结果为可读文本。"""
+    lines: List[str] = []
+    for i in range(predictions.shape[0]):
+        metrics = []
+        for j in range(predictions.shape[1]):
+            val = predictions[i, j]
+            unit = _SLEEP_METRIC_UNITS[j]
+            metrics.append(f"{_SLEEP_METRIC_LABELS[j]}：{_fmt(val, unit)}")
+        lines.append("，".join(metrics))
+    return lines
+
+
+def _format_control_policy(results: Dict[str, np.ndarray]) -> List[str]:
+    """格式化控制策略预测结果为可读文本。"""
+    lines: List[str] = []
+    for i in range(len(results["discrete_action"])):
+        act_idx = int(results["discrete_action"][i])
+        label = _DISCRETE_ACTION_LABELS[act_idx] if 0 <= act_idx < len(_DISCRETE_ACTION_LABELS) else f"未知({act_idx})"
+        lines.append(f"离散动作：{label}")
+
+    cont_actions = results["continuous_action"]
+    for i in range(cont_actions.shape[0]):
+        actions = [
+            f"{_CONTINUOUS_ACTION_LABELS[j]}{cont_actions[i, j]:+.2f}"
+            for j in range(cont_actions.shape[1])
+        ]
+        lines.append(f"连续动作（{'，'.join(actions)}）")
+
+    for i, sv in enumerate(results["state_value"].flatten()):
+        lines.append(f"状态价值：{sv:.4f}")
+
+    if "log_prob" in results:
+        for i, lp in enumerate(results["log_prob"].flatten()):
+            lines.append(f"动作对数概率：{lp:.4f}")
+
+    return lines
+
+
+def format_predictions(
+    model_type: str,
+    results: Dict[str, np.ndarray] | np.ndarray,
+) -> str:
+    """将预测结果转为可读文本。
+
+    Args:
+        model_type: 模型类型（env_quality / sleep_impact / control_policy）
+        results: 预测结果（dict 或 ndarray）
+
+    Returns:
+        可读文本字符串
+    """
+    if model_type == "env_quality":
+        assert isinstance(results, dict)
+        lines = _format_env_quality(results)
+    elif model_type == "sleep_impact":
+        assert isinstance(results, np.ndarray)
+        lines = _format_sleep_impact(results)
+    elif model_type == "control_policy":
+        assert isinstance(results, dict)
+        lines = _format_control_policy(results)
+    else:
+        lines = [f"未知模型类型：{model_type}"]
+    return "\n".join(lines)
+
 
 def load_model(model_type: str, checkpoint_path: str, device: str):
     """加载指定类型的模型及权重"""
@@ -30,7 +162,7 @@ def load_model(model_type: str, checkpoint_path: str, device: str):
             odor_vocab_size=5,
             odor_emb_dim=4,
             hidden_dim=64,
-            risk_dim=3,
+            risk_dim=4,
             num_classes=4,
         )
     elif model_type == "sleep_impact":
@@ -75,7 +207,9 @@ def predict_env_quality(model, numeric: np.ndarray, odor: np.ndarray) -> Dict[st
         numeric: shape (batch, 6) 或 (6,)
         odor: shape (batch,) 或标量
     Returns:
-        comfort (0~1), risk_probs (sigmoid), class_probs (softmax)
+        comfort (0~1),
+        risk_probs (softmax over 4 classes: 无风险/过热/过冷/气味不适),
+        class_probs (softmax over 4 classes: 优/良/中/差)
     """
     device = next(model.parameters()).device
     numeric = torch.FloatTensor(numeric).to(device)
@@ -86,7 +220,7 @@ def predict_env_quality(model, numeric: np.ndarray, odor: np.ndarray) -> Dict[st
 
     out = model(numeric, odor)
     comfort = out["comfort_score"].cpu().numpy()
-    risk_probs = torch.sigmoid(out["risk_logits"]).cpu().numpy()
+    risk_probs = torch.softmax(out["risk_logits"], dim=-1).cpu().numpy()
     class_probs = torch.softmax(out["class_logits"], dim=-1).cpu().numpy()
     class_pred = np.argmax(class_probs, axis=-1)
 
@@ -221,19 +355,26 @@ def main():
         results = predict_control(model, state_seq, seq_lengths, args.deterministic)
 
     # 输出
+    readable = format_predictions(args.model, results)
+
     if args.output:
         if isinstance(results, dict):
             np.savez(args.output, **results)
         else:
             np.save(args.output, results)
         logger.info(f"结果已保存至 {args.output}")
+        # 同时打印可读结果
+        print("\n" + readable)
     else:
         logger.info("预测结果：")
+        print("─" * 40)
+        print(readable)
+        print("─" * 40)
         if isinstance(results, dict):
             for k, v in results.items():
-                print(f"{k}: {v}")
+                print(f"  {k}: {v}")
         else:
-            print(results)
+            print("  raw:", results)
 
 
 if __name__ == "__main__":

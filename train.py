@@ -102,15 +102,38 @@ class SleepDataset(Dataset):
             self.sleep_history["subjective_sleep_quality"] = np.float32(0.5)
         _safe_numeric_fill(self.sleep_history, ["subjective_sleep_quality"])
 
-        self.env_data[ENV_NUMERIC_COLS] = StandardScaler().fit_transform(self.env_data[ENV_NUMERIC_COLS]).astype(np.float32)
+        # 保存 Scaler 实例以供推理阶段复用
+        self.env_scaler = StandardScaler()
+        self.env_data[ENV_NUMERIC_COLS] = self.env_scaler.fit_transform(self.env_data[ENV_NUMERIC_COLS]).astype(np.float32)
+
         static_scale_cols = [c for c in ["age", "bmi", "season", "habit_alcohol", "habit_caffeine", "habit_exercise", "habit_screen_time"] if c in self.static_data.columns]
+        self.static_scaler = StandardScaler()
         if static_scale_cols:
-            self.static_data[static_scale_cols] = StandardScaler().fit_transform(self.static_data[static_scale_cols]).astype(np.float32)
-        self.sleep_history[SLEEP_BASE_COLS] = StandardScaler().fit_transform(self.sleep_history[SLEEP_BASE_COLS]).astype(np.float32)
+            self.static_data[static_scale_cols] = self.static_scaler.fit_transform(self.static_data[static_scale_cols]).astype(np.float32)
+
+        self.sleep_scaler = StandardScaler()
+        self.sleep_history[SLEEP_BASE_COLS] = self.sleep_scaler.fit_transform(self.sleep_history[SLEEP_BASE_COLS]).astype(np.float32)
 
         if self.control_data is not None:
             _safe_numeric_fill(self.control_data, CONTROL_STATE_COLS + CONTROL_CONT_ACTION_COLS + ["action_discrete"])
-            self.control_data[CONTROL_STATE_COLS] = StandardScaler().fit_transform(self.control_data[CONTROL_STATE_COLS]).astype(np.float32)
+            self.control_scaler = StandardScaler()
+            self.control_data[CONTROL_STATE_COLS] = self.control_scaler.fit_transform(self.control_data[CONTROL_STATE_COLS]).astype(np.float32)
+        else:
+            self.control_scaler = None
+
+    @property
+    def scalers(self) -> dict:
+        """返回所有已拟合的 Scaler 字典，键名与 inference 模块一致。"""
+        result = {}
+        if hasattr(self, "env_scaler") and self.env_scaler is not None:
+            result["env_scaler"] = self.env_scaler
+        if hasattr(self, "static_scaler") and self.static_scaler is not None:
+            result["static_scaler"] = self.static_scaler
+        if hasattr(self, "sleep_scaler") and self.sleep_scaler is not None:
+            result["sleep_scaler"] = self.sleep_scaler
+        if hasattr(self, "control_scaler") and self.control_scaler is not None:
+            result["control_scaler"] = self.control_scaler
+        return result
 
     def __len__(self) -> int:
         if self.task == "env_quality":
@@ -160,9 +183,10 @@ def create_data_loaders(
     batch_size: int = 32,
     seq_len: int = 24,
     train_split: float = 0.8,
-) -> dict[str, DataLoader]:
-    """为所有可用任务创建 DataLoader。"""
+) -> tuple[dict[str, DataLoader], dict[str, SleepDataset]]:
+    """为所有可用任务创建 DataLoader，同时返回 dataset 引用以获取 scaler。"""
     loaders = {}
+    datasets = {}
     for task, required_attr in [
         ("env_quality", "env_labels_path"),
         ("sleep_prediction", None),
@@ -179,7 +203,8 @@ def create_data_loaders(
         train_ds, val_ds = random_split(dataset, [train_size, len(dataset) - train_size])
         loaders[f"{task}_train"] = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
         loaders[f"{task}_val"] = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
-    return loaders
+        datasets[task] = dataset
+    return loaders, datasets
 
 
 # 通用训练循环
@@ -324,7 +349,7 @@ def run_training(args: argparse.Namespace) -> None:
     checkpoint_dir = Path(args.data_dir) / "checkpoints"
     _ensure_dir(checkpoint_dir)
 
-    loaders = create_data_loaders(paths=paths, batch_size=args.batch_size, seq_len=args.seq_len, train_split=args.train_split)
+    loaders, datasets = create_data_loaders(paths=paths, batch_size=args.batch_size, seq_len=args.seq_len, train_split=args.train_split)
     models = build_models()
     device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
     print(f"使用设备: {device}")
@@ -353,8 +378,19 @@ def run_training(args: argparse.Namespace) -> None:
                 extra_metrics_fn=metrics_fn,
             )
 
-    print("训练完成。")
+    # 持久化所有 Scaler 工件，供推理管线复用
+    import joblib
+    from collections import OrderedDict
+    all_scalers = OrderedDict()
+    for task, ds in datasets.items():
+        for name, scaler in ds.scalers.items():
+            all_scalers[name] = scaler
+    if all_scalers:
+        scaler_path = checkpoint_dir / "preprocessing.pkl"
+        joblib.dump(all_scalers, scaler_path)
+        print(f"Scaler 工件已保存至 {scaler_path}（共 {len(all_scalers)} 个）")
 
+    print("训练完成。")
 
 if __name__ == "__main__":
     run_training(build_arg_parser().parse_args())

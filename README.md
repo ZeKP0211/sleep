@@ -57,3 +57,13 @@ python predict.py --model control_policy --checkpoint data/checkpoints/control_p
 | `control_policy` | `discrete_action` | 离散动作（开关类设备） |
 | | `continuous_action` | 连续动作（调节幅度） |
 | | `state_value` | 状态价值估计 |
+
+
+# 训练（生成 preprocessing.pkl + checkpoints）
+python train.py --generate-data --data-dir data --sample-users 100 --sample-days 30 --epochs 20
+
+# 导出 ONNX
+python export_onnx.py --checkpoint-dir data/checkpoints
+
+# 启动服务
+python -m inference.api --checkpoint-dir data/checkpoints --port 8000
