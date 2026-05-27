@@ -37,6 +37,8 @@ class EnvQualityRequest(BaseModel):
     temp: float = Field(..., description="室温（℃）")
     humidity: float = Field(..., description="相对湿度（%）")
     temp_humidity_interaction: float = Field(default=0.0, description="温湿度交互项")
+    body_temp: float = Field(default=0.0, description="人体表面温度（℃）")
+    body_humidity: float = Field(default=0.0, description="人体表面湿度（%）")
     odor_type: str = Field(default="无", description="气味类型：无/薰衣草/沉香/川芎/其他")
     odor_intensity: float = Field(default=0.0, description="气味强度 0~1")
     odor_duration: float = Field(default=0.0, description="气味时长（分钟）")

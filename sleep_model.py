@@ -1,7 +1,10 @@
 import torch
 import torch.nn as nn
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 from torch.distributions import Categorical, Normal
+
+if TYPE_CHECKING:
+    from config import ModelConfig
 
 
 class EnvQualityClassifier(nn.Module):
@@ -288,34 +291,50 @@ class ControlPolicyModel(nn.Module):
         return {**out, "log_prob": log_prob, "entropy": entropy}
 
 
-def build_models() -> dict:
-    """构建默认模型"""
+def build_models(config: "ModelConfig | None" = None) -> dict:
+    """从配置构建模型。
+
+    Args:
+        config: 模型配置。若为 None，使用默认配置。
+
+    Returns:
+        dict: 包含三个模型的字典，键名与 train.py 保持一致。
+    """
+    if config is None:
+        from config import get_default_config
+        config = get_default_config()
+
+    eq = config.env_quality
+    si = config.sleep_impact
+    cp = config.control_policy
+
     models = {
         "env_quality_classifier": EnvQualityClassifier(
-            numeric_dim=6,
-            odor_vocab_size=5,
-            odor_emb_dim=4,
-            hidden_dim=64,
-            risk_dim=4,
-            num_classes=4,
+            numeric_dim=eq.numeric_dim,
+            odor_vocab_size=eq.odor_vocab_size,
+            odor_emb_dim=eq.odor_emb_dim,
+            hidden_dim=eq.hidden_dim,
+            risk_dim=eq.risk_dim,
+            num_classes=eq.num_classes,
         ),
         "sleep_impact_predictor": SleepImpactPredictor(
-            env_seq_dim=4,
-            static_dim=11,  # age, gender, bmi, season, health_nose, health_asthma, health_depression, habit_alcohol, habit_caffeine, habit_exercise, habit_screen_time
-            hist_dim=5,
-            lstm_hidden_dim=64,
-            lstm_layers=2,
-            fusion_hidden_dim=128,
-            output_dim=6,  # sleep_efficiency, sleep_latency, deep_sleep_duration, awakenings, apnea_index, subjective_sleep_quality
-            dropout=0.2,
+            env_seq_dim=si.env_seq_dim,
+            static_dim=si.static_dim,
+            hist_dim=si.hist_dim,
+            lstm_hidden_dim=si.lstm_hidden_dim,
+            lstm_layers=si.lstm_layers,
+            fusion_hidden_dim=si.fusion_hidden_dim,
+            output_dim=si.output_dim,
+            dropout=si.dropout,
         ),
         "control_policy_model": ControlPolicyModel(
-            state_dim=5,  # temp, humidity, odor_intensity, sleep_stage, time_of_day
-            discrete_action_dim=3,  # 例如：开/关香薰，开/关空调，开/关风扇
-            continuous_action_dim=2,  # 例如：温度调节幅度，湿度调节幅度
-            hidden_dim=128,
-            rnn_layers=2,
-            rnn_type="GRU",
+            state_dim=cp.state_dim,
+            discrete_action_dim=cp.discrete_action_dim,
+            continuous_action_dim=cp.continuous_action_dim,
+            hidden_dim=cp.hidden_dim,
+            rnn_layers=cp.rnn_layers,
+            rnn_type=cp.rnn_type,
+            action_log_std_init=cp.action_log_std_init,
         ),
     }
     return models

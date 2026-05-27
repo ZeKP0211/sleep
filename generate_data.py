@@ -90,6 +90,10 @@ def generate_sample_data(num_users: int = 100, days_per_user: int = 30, output_d
                 humidity = np.random.normal(50, 10)
                 temp_humidity_interaction = temp * humidity / 100  # 简化交互
 
+                # 人体表面温度/湿度（与环境相关但有偏差）
+                body_temp = temp + np.random.normal(0.5, 0.5)  # 通常略高于室温
+                body_humidity = humidity + np.random.normal(2, 5)  # 人体表面湿度略高
+
                 odor_type = np.random.choice(odor_types)
                 odor_intensity = np.random.uniform(0, 1)
                 odor_duration = np.random.uniform(0, 60)  # 分钟
@@ -101,6 +105,8 @@ def generate_sample_data(num_users: int = 100, days_per_user: int = 30, output_d
                     'temp': temp,
                     'humidity': humidity,
                     'temp_humidity_interaction': temp_humidity_interaction,
+                    'body_temp': body_temp,
+                    'body_humidity': body_humidity,
                     'odor_type': odor_type,
                     'odor_intensity': odor_intensity,
                     'odor_duration': odor_duration,

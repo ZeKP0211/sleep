@@ -67,11 +67,12 @@ class ModelManager:
         """预测环境质量。
 
         Args:
-            numeric: shape (1, 6) float32
+            numeric: shape (1, numeric_dim) float32，维度由导出时模型配置决定
             odor_idx: shape (1,) int64
 
         Returns:
-            {"comfort_score": (1,), "risk_logits": (1,4), "class_logits": (1,4)}
+            {"comfort_score": (1,), "risk_logits": (1,risk_dim), "class_logits": (1,num_classes)}
+            各维度由导出时模型配置决定
         """
         session = self._get_session("env_quality")
         # 确保 batch 维度
@@ -104,13 +105,13 @@ class ModelManager:
         """预测睡眠指标。
 
         Args:
-            env_seq: (1, seq_len, 4) float32
-            static: (1, 11) float32
-            history: (1, 5) float32
+            env_seq: (1, seq_len, env_seq_dim) float32，维度由导出时模型配置决定
+            static: (1, static_dim) float32
+            history: (1, hist_dim) float32
             seq_lengths: (1,) int64 或 None
 
         Returns:
-            (1, 6) 预测值
+            (1, output_dim) 预测值，维度由导出时模型配置决定
         """
         session = self._get_session("sleep_impact")
         if env_seq.ndim == 2:
@@ -143,12 +144,13 @@ class ModelManager:
         """控制策略预测。
 
         Args:
-            state_seq: (1, seq_len, 5) float32
+            state_seq: (1, seq_len, state_dim) float32，维度由导出时模型配置决定
             seq_lengths: (1,) int64 或 None
-            deterministic: True 时返回均值动作
+            deterministic: True 时返回 argmax 离散动作 + 均值连续动作
 
         Returns:
             {"discrete_logits": ..., "continuous_mean": ..., "continuous_log_std": ..., "state_value": ...}
+            各输出维度由导出时模型配置决定
         """
         session = self._get_session("control_policy")
         if state_seq.ndim == 2:

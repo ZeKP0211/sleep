@@ -2,6 +2,8 @@
 """
 预测脚本：使用训练好的模型进行推理
 支持单样本预测、批量评估、可读结果输出
+
+维度参数从 [`ModelConfig`](config.py) 读取，也可从 checkpoint 目录自动加载。
 """
 
 import argparse
@@ -12,6 +14,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
+from config import ModelConfig, get_default_config
 from sleep_model import (
     EnvQualityClassifier,
     SleepImpactPredictor,
@@ -23,12 +26,9 @@ logger = logging.getLogger(__name__)
 
 # ──────────────────────────── 可读结果格式化 ────────────────────────────
 
-# 映射字典与 sleep_model.py 参数注释严格对齐
-# sleep_model.py L23: num_classes=4 → 优、良、中、差
+# 映射字典（与 config.py 中的语义对齐）
 _CLASS_LABELS = ["优", "良", "中", "差"]
-# sleep_model.py L22: risk_dim=4 → 无风险、过热、过冷、气味不适（与标签 0-3 对齐）
 _RISK_LABELS = ["无风险", "过热风险", "过冷风险", "气味不适风险"]
-# sleep_model.py L309: output_dim=6
 _SLEEP_METRIC_LABELS = [
     "睡眠效率",
     "入睡潜伏期",
@@ -38,33 +38,27 @@ _SLEEP_METRIC_LABELS = [
     "主观睡眠质量",
 ]
 _SLEEP_METRIC_UNITS = ["%", "分钟", "小时", "次", "", "分"]
-# sleep_model.py L314: discrete_action_dim=3 → 开/关香薰，开/关空调，开/关风扇
 _DISCRETE_ACTION_LABELS = ["香薰开关", "空调开关", "风扇开关"]
-# sleep_model.py L315: continuous_action_dim=2 → 温度调节幅度，湿度调节幅度
 _CONTINUOUS_ACTION_LABELS = ["温度调节幅度", "湿度调节幅度"]
 
 
 def _format_env_quality(results: Dict[str, np.ndarray]) -> List[str]:
     """格式化环境质量预测结果为可读文本。"""
     lines: List[str] = []
-    # class_pred
     for i in range(len(results["class_pred"])):
         cls_idx = int(results["class_pred"][i])
         label = _CLASS_LABELS[cls_idx] if 0 <= cls_idx < len(_CLASS_LABELS) else f"未知({cls_idx})"
         lines.append(f"环境质量分类：{label}")
 
-    # comfort
     for i, c in enumerate(results["comfort"].flatten()):
         desc = "高" if c >= 0.7 else ("中" if c >= 0.4 else "低")
         lines.append(f"舒适度：{c:.2%}（{desc}）")
 
-    # risk_probs（4 类 softmax：无风险、过热、过冷、气味不适）
     risk_probs = results["risk_probs"]
     for i in range(risk_probs.shape[0]):
         risks = [f"{_RISK_LABELS[j]}{risk_probs[i, j]:.1%}" for j in range(risk_probs.shape[1])]
         lines.append(f"风险概率：{'，'.join(risks)}")
 
-    # class_probs
     class_probs = results["class_probs"]
     for i in range(class_probs.shape[0]):
         probs = [f"{_CLASS_LABELS[j]}{class_probs[i, j]:.1%}" for j in range(class_probs.shape[1])]
@@ -95,7 +89,7 @@ def _format_sleep_impact(predictions: np.ndarray) -> List[str]:
         metrics = []
         for j in range(predictions.shape[1]):
             val = predictions[i, j]
-            unit = _SLEEP_METRIC_UNITS[j]
+            unit = _SLEEP_METRIC_UNITS[j] if j < len(_SLEEP_METRIC_UNITS) else ""
             metrics.append(f"{_SLEEP_METRIC_LABELS[j]}：{_fmt(val, unit)}")
         lines.append("，".join(metrics))
     return lines
@@ -106,14 +100,19 @@ def _format_control_policy(results: Dict[str, np.ndarray]) -> List[str]:
     lines: List[str] = []
     for i in range(len(results["discrete_action"])):
         act_idx = int(results["discrete_action"][i])
-        label = _DISCRETE_ACTION_LABELS[act_idx] if 0 <= act_idx < len(_DISCRETE_ACTION_LABELS) else f"未知({act_idx})"
+        label = (
+            _DISCRETE_ACTION_LABELS[act_idx]
+            if 0 <= act_idx < len(_DISCRETE_ACTION_LABELS)
+            else f"未知({act_idx})"
+        )
         lines.append(f"离散动作：{label}")
 
     cont_actions = results["continuous_action"]
     for i in range(cont_actions.shape[0]):
+        n_cont = min(cont_actions.shape[1], len(_CONTINUOUS_ACTION_LABELS))
         actions = [
             f"{_CONTINUOUS_ACTION_LABELS[j]}{cont_actions[i, j]:+.2f}"
-            for j in range(cont_actions.shape[1])
+            for j in range(n_cont)
         ]
         lines.append(f"连续动作（{'，'.join(actions)}）")
 
@@ -131,15 +130,7 @@ def format_predictions(
     model_type: str,
     results: Dict[str, np.ndarray] | np.ndarray,
 ) -> str:
-    """将预测结果转为可读文本。
-
-    Args:
-        model_type: 模型类型（env_quality / sleep_impact / control_policy）
-        results: 预测结果（dict 或 ndarray）
-
-    Returns:
-        可读文本字符串
-    """
+    """将预测结果转为可读文本。"""
     if model_type == "env_quality":
         assert isinstance(results, dict)
         lines = _format_env_quality(results)
@@ -154,36 +145,54 @@ def format_predictions(
     return "\n".join(lines)
 
 
-def load_model(model_type: str, checkpoint_path: str, device: str):
-    """加载指定类型的模型及权重"""
+def load_model(
+    model_type: str,
+    checkpoint_path: str,
+    device: str,
+    config: Optional[ModelConfig] = None,
+):
+    """加载指定类型的模型及权重。
+
+    Args:
+        model_type: 模型类型
+        checkpoint_path: 权重文件路径
+        device: 推理设备
+        config: 模型配置。若为 None，使用默认配置。
+    """
+    if config is None:
+        config = get_default_config()
+
     if model_type == "env_quality":
+        eq = config.env_quality
         model = EnvQualityClassifier(
-            numeric_dim=6,
-            odor_vocab_size=5,
-            odor_emb_dim=4,
-            hidden_dim=64,
-            risk_dim=4,
-            num_classes=4,
+            numeric_dim=eq.numeric_dim,
+            odor_vocab_size=eq.odor_vocab_size,
+            odor_emb_dim=eq.odor_emb_dim,
+            hidden_dim=eq.hidden_dim,
+            risk_dim=eq.risk_dim,
+            num_classes=eq.num_classes,
         )
     elif model_type == "sleep_impact":
+        si = config.sleep_impact
         model = SleepImpactPredictor(
-            env_seq_dim=4,
-            static_dim=11,
-            hist_dim=5,
-            lstm_hidden_dim=64,
-            lstm_layers=2,
-            fusion_hidden_dim=128,
-            output_dim=6,
+            env_seq_dim=si.env_seq_dim,
+            static_dim=si.static_dim,
+            hist_dim=si.hist_dim,
+            lstm_hidden_dim=si.lstm_hidden_dim,
+            lstm_layers=si.lstm_layers,
+            fusion_hidden_dim=si.fusion_hidden_dim,
+            output_dim=si.output_dim,
             dropout=0.0,
         )
     elif model_type == "control_policy":
+        cp = config.control_policy
         model = ControlPolicyModel(
-            state_dim=5,
-            discrete_action_dim=3,
-            continuous_action_dim=2,
-            hidden_dim=128,
-            rnn_layers=2,
-            rnn_type="GRU",
+            state_dim=cp.state_dim,
+            discrete_action_dim=cp.discrete_action_dim,
+            continuous_action_dim=cp.continuous_action_dim,
+            hidden_dim=cp.hidden_dim,
+            rnn_layers=cp.rnn_layers,
+            rnn_type=cp.rnn_type,
         )
     else:
         raise ValueError(f"未知模型类型: {model_type}")
@@ -192,7 +201,7 @@ def load_model(model_type: str, checkpoint_path: str, device: str):
     if "state_dict" in checkpoint:
         model.load_state_dict(checkpoint["state_dict"])
     else:
-        model.load_state_dict(checkpoint)  # 直接是state_dict
+        model.load_state_dict(checkpoint)
     model.to(device)
     model.eval()
     logger.info(f"模型 {model_type} 已加载权重: {checkpoint_path}")
@@ -201,22 +210,12 @@ def load_model(model_type: str, checkpoint_path: str, device: str):
 
 @torch.no_grad()
 def predict_env_quality(model, numeric: np.ndarray, odor: np.ndarray) -> Dict[str, np.ndarray]:
-    """
-    预测环境质量
-    Args:
-        numeric: shape (batch, 6) 或 (6,)
-        odor: shape (batch,) 或标量
-    Returns:
-        comfort (0~1),
-        risk_probs (softmax over 4 classes: 无风险/过热/过冷/气味不适),
-        class_probs (softmax over 4 classes: 优/良/中/差)
-    """
+    """预测环境质量"""
     device = next(model.parameters()).device
     numeric = torch.FloatTensor(numeric).to(device)
     odor = torch.LongTensor(odor).to(device)
     if numeric.dim() == 1:
         numeric = numeric.unsqueeze(0)
-    # Embedding 接受 (batch,) 或标量，不需要 unsqueeze
 
     out = model(numeric, odor)
     comfort = out["comfort_score"].cpu().numpy()
@@ -240,17 +239,7 @@ def predict_sleep_impact(
     history: np.ndarray,
     seq_lengths: np.ndarray = None,
 ) -> np.ndarray:
-    """
-    预测睡眠指标
-    Args:
-        env_seq: (batch, T, 4)
-        static: (batch, 11)
-        history: (batch, 5)
-        seq_lengths: (batch,) 或 None
-    Returns:
-        预测值数组 (batch, 6)，顺序:
-        [睡眠效率, 入睡潜伏期, 深睡时长, 觉醒次数, 呼吸暂停指数, 主观睡眠质量]
-    """
+    """预测睡眠指标"""
     device = next(model.parameters()).device
     env_seq = torch.FloatTensor(env_seq).to(device)
     static = torch.FloatTensor(static).to(device)
@@ -264,7 +253,7 @@ def predict_sleep_impact(
     else:
         seq_lengths = None
 
-    outputs = model(env_seq, static, history, seq_lengths)  # (batch, 6)
+    outputs = model(env_seq, static, history, seq_lengths)
     return outputs.cpu().numpy()
 
 
@@ -275,15 +264,7 @@ def predict_control(
     seq_lengths: np.ndarray = None,
     deterministic: bool = False,
 ) -> Dict[str, np.ndarray]:
-    """
-    控制策略预测（生成动作）
-    Args:
-        state_seq: (batch, T, 5) 或 (T, 5)
-        seq_lengths: (batch,) 或 None
-        deterministic: True 时使用均值（连续动作），离散动作取 argmax
-    Returns:
-        discrete_action, continuous_action, state_value
-    """
+    """控制策略预测（生成动作）"""
     device = next(model.parameters()).device
     state_seq = torch.FloatTensor(state_seq).to(device)
     if state_seq.dim() == 2:
@@ -318,30 +299,50 @@ def predict_control(
 
 def main():
     parser = argparse.ArgumentParser(description="模型预测脚本")
-    parser.add_argument("--model", type=str, required=True,
-                        choices=["env_quality", "sleep_impact", "control_policy"],
-                        help="模型类型")
-    parser.add_argument("--checkpoint", type=str, required=True,
-                        help="模型权重路径")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--input", type=str, required=True,
-                        help="输入数据文件（.npz 格式）")
-    parser.add_argument("--output", type=str, default=None,
-                        help="结果保存路径（.npy 或 .npz），若不指定则打印")
-    parser.add_argument("--deterministic", action="store_true",
-                        help="控制策略是否使用确定性动作（默认随机采样）")
+    parser.add_argument(
+        "--model", type=str, required=True,
+        choices=["env_quality", "sleep_impact", "control_policy"],
+        help="模型类型",
+    )
+    parser.add_argument("--checkpoint", type=str, required=True, help="模型权重路径")
+    parser.add_argument(
+        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
+    )
+    parser.add_argument("--input", type=str, required=True, help="输入数据文件（.npz 格式）")
+    parser.add_argument("--output", type=str, default=None, help="结果保存路径")
+    parser.add_argument(
+        "--deterministic", action="store_true",
+        help="控制策略是否使用确定性动作（默认随机采样）",
+    )
+    parser.add_argument(
+        "--config", type=str, default=None,
+        help="model_config.json 路径（可选，默认从 checkpoint 目录自动加载）",
+    )
     args = parser.parse_args()
 
+    # 加载配置
+    from pathlib import Path
+    if args.config:
+        config = ModelConfig.load(args.config)
+    else:
+        auto_path = Path(args.checkpoint).parent / "model_config.json"
+        if auto_path.exists():
+            config = ModelConfig.load(str(auto_path))
+            logger.info(f"自动加载配置: {auto_path}")
+        else:
+            config = get_default_config()
+            logger.info("使用默认配置")
+
     # 加载模型
-    model = load_model(args.model, args.checkpoint, args.device)
+    model = load_model(args.model, args.checkpoint, args.device, config)
 
     # 读取输入数据
     data = dict(np.load(args.input, allow_pickle=True))
 
     # 根据模型类型进行推理
     if args.model == "env_quality":
-        numeric = data["numeric"]  # (N, 6) 或 (6,)
-        odor = data["odor"]        # (N,) 或标量
+        numeric = data["numeric"]
+        odor = data["odor"]
         results = predict_env_quality(model, numeric, odor)
     elif args.model == "sleep_impact":
         env_seq = data["env_seq"]
@@ -363,7 +364,6 @@ def main():
         else:
             np.save(args.output, results)
         logger.info(f"结果已保存至 {args.output}")
-        # 同时打印可读结果
         print("\n" + readable)
     else:
         logger.info("预测结果：")
