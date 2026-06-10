@@ -66,7 +66,7 @@ def _create_control_policy(config: ModelConfig) -> ControlPolicyModel:
 _MODEL_REGISTRY = {
     "env_quality": (_create_env_quality, "env_quality_best.pth"),
     "sleep_impact": (_create_sleep_impact, "sleep_prediction_best.pth"),
-    "control_policy": (_create_control_policy, "control_policy_best.pth"),
+    "control_policy": (_create_control_policy, "actor_critic_best.pth"),
 }
 
 

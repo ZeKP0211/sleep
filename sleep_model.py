@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional, TYPE_CHECKING
 from torch.distributions import Categorical, Normal
 
@@ -175,12 +176,19 @@ class SleepImpactPredictor(nn.Module):
 
 
 class ControlPolicyModel(nn.Module):
-    """控制策略模型（Actor-Critic）
+    """控制策略模型（PPO Actor-Critic）
 
     输入状态：当前时间、温湿度、气味、睡眠阶段、历史行为/设备状态等。
     输出：
-      Actor（策略）：离散动作 logits + 连续动作分布参数
+      Actor（策略）：离散动作 logits + 连续动作分布参数（状态依赖）
       Critic（价值）：状态价值 V(s)
+
+    关键改进（相对原始版本）：
+      - continuous_log_std 由状态依赖 head 输出，不再使用全局参数
+      - 添加 Dropout 正则化
+      - 添加 std 下界保护（softplus）
+      - act() 支持 deterministic 模式
+      - evaluate_actions() 返回完整的 PPO 所需字段
     """
 
     _RNN_MAP = {"GRU": nn.GRU, "LSTM": nn.LSTM}
@@ -194,8 +202,15 @@ class ControlPolicyModel(nn.Module):
         rnn_layers: int = 2,
         rnn_type: str = "GRU",
         action_log_std_init: float = -0.5,
+        dropout: float = 0.2,
+        log_std_min: float = -5.0,
+        log_std_max: float = 1.0,
     ):
         super().__init__()
+        self.continuous_action_dim = continuous_action_dim
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
+
         rnn_cls = self._RNN_MAP.get(rnn_type)
         if rnn_cls is None:
             raise ValueError(f"Unsupported rnn_type='{rnn_type}', expected 'GRU' or 'LSTM'")
@@ -204,18 +219,24 @@ class ControlPolicyModel(nn.Module):
             hidden_size=hidden_dim,
             num_layers=rnn_layers,
             batch_first=True,
-            dropout=0.2 if rnn_layers > 1 else 0.0,
+            dropout=dropout if rnn_layers > 1 else 0.0,
         )
+
+        # 正则化：RNN 输出后的 Dropout
+        self.output_dropout = nn.Dropout(dropout)
 
         # Actor heads
         self.discrete_head = nn.Linear(hidden_dim, discrete_action_dim)
         self.continuous_mean_head = nn.Linear(hidden_dim, continuous_action_dim)
-        self.continuous_log_std = nn.Parameter(
-            torch.full((continuous_action_dim,), action_log_std_init)
-        )
+        # 状态依赖的 log_std（替代全局参数）
+        self.continuous_log_std_head = nn.Linear(hidden_dim, continuous_action_dim)
 
         # Critic head
         self.value_head = nn.Linear(hidden_dim, 1)
+
+        # 初始化 log_std head 的偏置，使其初始输出接近 action_log_std_init
+        nn.init.constant_(self.continuous_log_std_head.bias, action_log_std_init)
+        nn.init.zeros_(self.continuous_log_std_head.weight)
 
     def _encode_state(
         self, state_seq: torch.Tensor, seq_lengths: Optional[torch.Tensor] = None
@@ -234,13 +255,21 @@ class ControlPolicyModel(nn.Module):
             final_hidden = rnn_out[:, -1, :]
         return final_hidden
 
+    def _get_log_std(self, hidden: torch.Tensor) -> torch.Tensor:
+        """从隐状态计算状态依赖的连续动作 log_std，带 clamp 保护。"""
+        raw = self.continuous_log_std_head(hidden)
+        return torch.clamp(raw, self.log_std_min, self.log_std_max)
+
     def forward(
         self, state_seq: torch.Tensor, seq_lengths: Optional[torch.Tensor] = None
     ) -> dict[str, torch.Tensor]:
         final_hidden = self._encode_state(state_seq, seq_lengths)
+        # Dropout 正则化
+        final_hidden = self.output_dropout(final_hidden)
+
         discrete_logits = self.discrete_head(final_hidden)
         continuous_mean = self.continuous_mean_head(final_hidden)
-        continuous_log_std = self.continuous_log_std.unsqueeze(0).expand_as(continuous_mean)
+        continuous_log_std = self._get_log_std(final_hidden)
         state_value = self.value_head(final_hidden).squeeze(-1)
 
         return {
@@ -253,24 +282,49 @@ class ControlPolicyModel(nn.Module):
     def _make_dist(self, out: dict[str, torch.Tensor]):
         """从 forward 输出创建离散 + 连续分布。"""
         discrete_dist = Categorical(logits=out["discrete_logits"])
-        continuous_std = torch.exp(out["continuous_log_std"])
+        # 用 softplus 确保标准差有下界（exp(clamp 后的 log_std) 已受 clamp 保护，双保险）
+        continuous_std = F.softplus(out["continuous_log_std"])
         continuous_dist = Normal(out["continuous_mean"], continuous_std)
         return discrete_dist, continuous_dist
 
     def act(
-        self, state_seq: torch.Tensor, seq_lengths: Optional[torch.Tensor] = None
+        self,
+        state_seq: torch.Tensor,
+        seq_lengths: Optional[torch.Tensor] = None,
+        deterministic: bool = False,
     ) -> dict[str, torch.Tensor]:
+        """采样或确定性选择动作。
+
+        Args:
+            state_seq: 状态序列 (batch, seq_len, state_dim)
+            seq_lengths: 各样本的有效序列长度
+            deterministic: 若为 True，离散取 argmax，连续取 mean；否则采样。
+
+        Returns:
+            包含动作、分布、log_prob、entropy、value 的字典。
+        """
         out = self.forward(state_seq, seq_lengths)
         discrete_dist, continuous_dist = self._make_dist(out)
 
-        discrete_action = discrete_dist.sample()
-        continuous_action = continuous_dist.sample()
+        if deterministic:
+            discrete_action = discrete_dist.probs.argmax(dim=-1)
+            continuous_action = continuous_dist.mean
+        else:
+            discrete_action = discrete_dist.sample()
+            continuous_action = continuous_dist.sample()
+
         log_prob = discrete_dist.log_prob(discrete_action) + continuous_dist.log_prob(
             continuous_action
         ).sum(dim=-1)
         entropy = discrete_dist.entropy() + continuous_dist.entropy().sum(dim=-1)
 
-        return {**out, "discrete_action": discrete_action, "continuous_action": continuous_action, "log_prob": log_prob, "entropy": entropy}
+        return {
+            **out,
+            "discrete_action": discrete_action,
+            "continuous_action": continuous_action,
+            "log_prob": log_prob,
+            "entropy": entropy,
+        }
 
     def evaluate_actions(
         self,
@@ -279,7 +333,12 @@ class ControlPolicyModel(nn.Module):
         continuous_actions: torch.Tensor,
         seq_lengths: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
-        """评估给定动作的 log_prob / entropy / value，用于 PPO 损失。"""
+        """评估给定动作的 log_prob / entropy / value，用于 PPO 损失。
+
+        Returns:
+            包含 state_value, discrete_logits, continuous_mean, continuous_log_std,
+            log_prob, entropy 的字典。
+        """
         out = self.forward(state_seq, seq_lengths)
         discrete_dist, continuous_dist = self._make_dist(out)
 
@@ -288,7 +347,11 @@ class ControlPolicyModel(nn.Module):
         ).sum(dim=-1)
         entropy = discrete_dist.entropy() + continuous_dist.entropy().sum(dim=-1)
 
-        return {**out, "log_prob": log_prob, "entropy": entropy}
+        return {
+            **out,
+            "log_prob": log_prob,
+            "entropy": entropy,
+        }
 
 
 def build_models(config: "ModelConfig | None" = None) -> dict:
@@ -338,5 +401,3 @@ def build_models(config: "ModelConfig | None" = None) -> dict:
         ),
     }
     return models
-
-

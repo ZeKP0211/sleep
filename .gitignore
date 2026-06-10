@@ -1,8 +1,8 @@
 /.vscode
 /data
-/generate_data.py
-/split_dataset.py
+.gitignore
 /todo.txt
-/train.py
-/validate_split.py
-/__pycache__
+plans
+__pycache__
+/input_env_quality.npz
+/input_sleep_impact.npz

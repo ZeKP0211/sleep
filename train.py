@@ -13,6 +13,7 @@
 """
 
 import argparse
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -26,13 +27,19 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Dataset, random_split
 
 from config import (
+    ControlPolicyConfig,
     DataConfig,
     ModelConfig,
     get_default_config,
     get_default_data_config,
 )
-from losses import control_policy_losses, env_quality_loss, sleep_impact_loss
-from sleep_model import build_models
+from losses import (
+    compute_gae,
+    env_quality_loss,
+    ppo_loss,
+    sleep_impact_loss,
+)
+from sleep_model import ControlPolicyModel, build_models
 
 
 # ── 数据路径配置 ──
@@ -241,6 +248,7 @@ class SleepDataset(Dataset):
             seq_len_tensor = torch.tensor(max(1, min(seq_len_raw, self.seq_len)), dtype=torch.long)
             return env_seq, static_feat, hist_feat, seq_len_tensor, target
 
+        # control_policy: 返回 (state_seq, seq_len, action_discrete, action_cont, reward, done)
         assert self.control_data is not None
         ctrl_state_cols = list(self.cfg.control_state_cols)
         ctrl_cont_cols = list(self.cfg.control_cont_action_cols)
@@ -252,7 +260,23 @@ class SleepDataset(Dataset):
         action_cont = torch.tensor(
             seq_data[ctrl_cont_cols].values[-1].astype(np.float32), dtype=torch.float32
         )
-        return state_seq, torch.tensor(self.seq_len, dtype=torch.long), action_discrete, action_cont
+
+        # reward: 使用最后一步的奖励（PPO 每步的即时奖励）
+        reward_col = "reward" if "reward" in self.control_data.columns else "action_reward"
+        if reward_col in seq_data.columns:
+            reward = torch.tensor(float(seq_data[reward_col].values[-1]), dtype=torch.float32)
+        else:
+            reward = torch.tensor(0.0, dtype=torch.float32)
+
+        # done: 如果是数据集末尾或在用户边界，标记为 done
+        is_last = idx >= len(self) - 1
+        if not is_last and idx + self.seq_len < len(self.control_data):
+            current_user = self.control_data.iloc[idx]["user_id"]
+            next_user = self.control_data.iloc[idx + self.seq_len]["user_id"]
+            is_last = current_user != next_user
+        done = torch.tensor(1.0 if is_last else 0.0, dtype=torch.float32)
+
+        return state_seq, torch.tensor(self.seq_len, dtype=torch.long), action_discrete, action_cont, reward, done
 
 
 # ── DataLoader 创建 ──
@@ -375,17 +399,181 @@ def _sleep_forward(model, batch):
     )
 
 
-def _control_forward(entropy_coef):
-    def fn(model, batch):
-        state_seq, seq_lengths, action_discrete, action_cont = batch
-        eval_out = model.evaluate_actions(
-            state_seq, action_discrete, action_cont, seq_lengths=seq_lengths
-        )
-        return control_policy_losses(eval_out, action_discrete, action_cont, entropy_coef=entropy_coef)[
-            "loss"
-        ]
+# ── PPO 训练函数 ──
 
-    return fn
+def _run_ppo_train(
+    model: ControlPolicyModel,
+    dataset: SleepDataset,
+    config: ControlPolicyConfig,
+    device: str,
+    num_epochs: int,
+    lr: float,
+    checkpoint_path: Optional[Path] = None,
+    checkpoint_dir: Optional[Path] = None,
+) -> None:
+    """使用 PPO 训练控制策略模型（在线 rollout 收集 + GAE + Clipped Objective）。
+
+    Args:
+        model: ControlPolicyModel 实例
+        dataset: 控制策略 SleepDataset（完整数据集）
+        config: ControlPolicyConfig（含 PPO 超参数）
+        device: 'cpu' 或 'cuda'
+        num_epochs: 外层训练 epoch 数
+        lr: 学习率
+        checkpoint_path: 模型 checkpoint 保存路径
+        checkpoint_dir: checkpoint 目录（用于保存中间模型）
+    """
+    model.to(device)
+    if checkpoint_path and checkpoint_path.exists():
+        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+        print(f"Loaded existing PPO checkpoint from {checkpoint_path}")
+
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    best_val_loss = float("inf")
+
+    # PPO 超参数
+    clip_ratio = config.ppo_clip_ratio
+    value_coef = config.ppo_value_coef
+    entropy_coef = config.ppo_entropy_coef
+    gamma = config.ppo_gamma
+    lam = config.ppo_lam
+    rollout_steps = config.ppo_rollout_steps
+    ppo_epochs = config.ppo_epochs
+    max_grad_norm = config.ppo_max_grad_norm
+
+    seq_len = dataset.seq_len
+    total_samples = len(dataset)
+
+    for epoch in range(num_epochs):
+        # ── 阶段 1: Rollout 收集 ──
+        # 从数据集中顺序采样 rollout_steps 个样本
+        indices = torch.randperm(total_samples)[:rollout_steps].tolist()
+
+        all_states = []
+        all_actions_discrete = []
+        all_actions_cont = []
+        all_old_log_probs = []
+        all_rewards = []
+        all_dones = []
+        all_seq_lengths = []
+
+        model.eval()
+        with torch.no_grad():
+            for idx in indices:
+                state_seq, seq_len_t, action_disc, action_cont, reward, done = dataset[idx]
+                state_seq = state_seq.unsqueeze(0).to(device)  # (1, seq_len, state_dim)
+                seq_len_t = seq_len_t.unsqueeze(0).to(device)
+
+                # 使用当前策略采样动作
+                act_out = model.act(state_seq, seq_lengths=seq_len_t, deterministic=False)
+
+                all_states.append(state_seq.squeeze(0))
+                all_actions_discrete.append(action_disc.to(device))
+                all_actions_cont.append(action_cont.to(device))
+                all_old_log_probs.append(act_out["log_prob"].squeeze(0))
+                all_rewards.append(reward.to(device))
+                all_dones.append(done.to(device))
+                all_seq_lengths.append(seq_len_t.squeeze(0))
+
+        # 构造 rollout tensor: (rollout_steps, seq_len, state_dim) etc.
+        states = torch.stack(all_states, dim=0)  # (rollout_steps, seq_len, state_dim)
+        actions_discrete = torch.stack(all_actions_discrete, dim=0)
+        actions_cont = torch.stack(all_actions_cont, dim=0)
+        old_log_probs = torch.stack(all_old_log_probs, dim=0).detach()
+        rewards = torch.stack(all_rewards, dim=0).detach()
+        dones = torch.stack(all_dones, dim=0).detach()
+        seq_lengths_tensor = torch.stack(all_seq_lengths, dim=0)
+
+        # ── 阶段 2: GAE 计算 ──
+        # 获取所有状态的 value 估计
+        model.eval()
+        with torch.no_grad():
+            forward_out = model.forward(states, seq_lengths=seq_lengths_tensor)
+            values = forward_out["state_value"]  # (rollout_steps,)
+
+        # 重新整理为 (1, rollout_steps) 用于 GAE
+        rewards_2d = rewards.unsqueeze(0)
+        values_2d = values.unsqueeze(0)
+        dones_2d = dones.unsqueeze(0)
+
+        advantages, returns = compute_gae(rewards_2d, values_2d, dones_2d, gamma=gamma, lam=lam)
+
+        # 展平为 (rollout_steps,)
+        advantages = advantages.squeeze(0).detach()
+        returns = returns.squeeze(0).detach()
+
+        # Advantage 标准化
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # ── 阶段 3: PPO 更新 ──
+        model.train()
+        for ppo_epoch in range(ppo_epochs):
+            optimizer.zero_grad()
+            eval_out = model.evaluate_actions(
+                states, actions_discrete, actions_cont, seq_lengths=seq_lengths_tensor
+            )
+            loss_dict = ppo_loss(
+                eval_out=eval_out,
+                old_log_prob=old_log_probs,
+                advantages=advantages,
+                returns=returns,
+                discrete_actions=actions_discrete,
+                continuous_actions=actions_cont,
+                clip_ratio=clip_ratio,
+                value_coef=value_coef,
+                entropy_coef=entropy_coef,
+                max_grad_norm=max_grad_norm,
+            )
+            loss = loss_dict["loss"]
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
+
+        # ── 阶段 4: 评估（在部分验证数据上计算平均回报和 loss） ──
+        model.eval()
+        val_indices = torch.randperm(total_samples)[:rollout_steps].tolist()
+        val_rewards = []
+        val_advantages = []
+        with torch.no_grad():
+            for idx in val_indices:
+                state_seq, seq_len_t, action_disc, action_cont, reward, done = dataset[idx]
+                state_seq = state_seq.unsqueeze(0).to(device)
+                seq_len_t = seq_len_t.unsqueeze(0).to(device)
+                action_disc = action_disc.unsqueeze(0).to(device)
+                action_cont = action_cont.unsqueeze(0).to(device)
+
+                eval_out = model.evaluate_actions(
+                    state_seq, action_disc, action_cont, seq_lengths=seq_len_t
+                )
+                val_rewards.append(reward)
+
+                # 简单 advantage = V(s) - r（近似评估）
+                advantage_est = (eval_out["state_value"].squeeze(0) - reward.to(device)).abs()
+                val_advantages.append(advantage_est)
+
+        avg_reward = torch.stack([r.to(device) for r in val_rewards]).mean().item() if val_rewards else 0.0
+        avg_val_adv = torch.stack(val_advantages).mean().item() if val_advantages else 0.0
+
+        verbose = (
+            f"[actor_critic][{epoch+1}/{num_epochs}] "
+            f"policy_loss={loss_dict['policy_loss'].item():.4f} "
+            f"value_loss={loss_dict['value_loss'].item():.4f} "
+            f"entropy={loss_dict['entropy'].item():.4f} "
+            f"approx_kl={loss_dict['approx_kl'].item():.6f} "
+            f"clip_frac={loss_dict['clip_fraction'].item():.4f} "
+            f"avg_reward={avg_reward:.4f} "
+            f"val_adv={avg_val_adv:.4f}"
+        )
+        print(verbose)
+
+        # 保存最佳模型
+        if avg_val_adv < best_val_loss and checkpoint_path:
+            best_val_loss = avg_val_adv
+            torch.save(model.state_dict(), checkpoint_path)
+
+        # 每个 epoch 保存中间 checkpoint
+        if checkpoint_dir:
+            torch.save(model.state_dict(), checkpoint_dir / f"actor_critic_epoch{epoch+1}.pth")
 
 
 # ── 参数解析 ──
@@ -397,6 +585,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sample-users", type=int, default=20)
     parser.add_argument("--sample-days", type=int, default=3)
     parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--ppo-epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--seq-len", type=int, default=6)
     parser.add_argument("--train-split", type=float, default=0.8)
@@ -427,6 +616,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     dim_group.add_argument("--ctrl-hidden-dim", type=int, default=None)
     dim_group.add_argument("--ctrl-rnn-layers", type=int, default=None)
     dim_group.add_argument("--ctrl-rnn-type", type=str, default=None, choices=["GRU", "LSTM"])
+
+    # ── PPO 超参数覆盖 ──
+    ppo_group = parser.add_argument_group("PPO 超参数覆盖")
+    ppo_group.add_argument("--ppo-clip-ratio", type=float, default=None)
+    ppo_group.add_argument("--ppo-gamma", type=float, default=None)
+    ppo_group.add_argument("--ppo-lam", type=float, default=None)
+    ppo_group.add_argument("--ppo-rollout-steps", type=int, default=None)
 
     return parser
 
@@ -463,6 +659,16 @@ def _apply_cli_overrides(config: ModelConfig, args: argparse.Namespace) -> Model
         cp.rnn_layers = args.ctrl_rnn_layers
     if args.ctrl_rnn_type is not None:
         cp.rnn_type = args.ctrl_rnn_type
+
+    # PPO 超参数覆盖
+    if args.ppo_clip_ratio is not None:
+        cp.ppo_clip_ratio = args.ppo_clip_ratio
+    if args.ppo_gamma is not None:
+        cp.ppo_gamma = args.ppo_gamma
+    if args.ppo_lam is not None:
+        cp.ppo_lam = args.ppo_lam
+    if args.ppo_rollout_steps is not None:
+        cp.ppo_rollout_steps = args.ppo_rollout_steps
 
     return config
 
@@ -520,7 +726,7 @@ def run_training(args: argparse.Namespace) -> None:
     device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
     print(f"使用设备: {device}")
 
-    # 任务配置列表
+    # ── 环境质量 + 睡眠预测：使用标准监督训练 ──
     task_configs = [
         (
             "env_quality",
@@ -536,14 +742,6 @@ def run_training(args: argparse.Namespace) -> None:
             _sleep_forward,
             "sleep_prediction",
             "sleep",
-            None,
-        ),
-        (
-            "control_policy",
-            models["control_policy_model"],
-            _control_forward(args.entropy_coef),
-            "control_policy",
-            "actor_critic",
             None,
         ),
     ]
@@ -565,9 +763,22 @@ def run_training(args: argparse.Namespace) -> None:
                 extra_metrics_fn=metrics_fn,
             )
 
+    # ── 控制策略：使用 PPO 训练 ──
+    if "control_policy" in datasets:
+        print("开始 PPO 训练控制策略模型...")
+        _run_ppo_train(
+            model=models["control_policy_model"],
+            dataset=datasets["control_policy"],
+            config=model_config.control_policy,
+            device=device,
+            num_epochs=args.ppo_epochs,
+            lr=args.lr,
+            checkpoint_path=checkpoint_dir / "actor_critic_best.pth",
+            checkpoint_dir=checkpoint_dir,
+        )
+
     # 持久化 Scaler 工件
     import joblib
-    from collections import OrderedDict
 
     all_scalers = OrderedDict()
     for task, ds in datasets.items():

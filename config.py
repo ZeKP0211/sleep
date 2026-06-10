@@ -126,6 +126,31 @@ class ControlPolicyConfig:
     action_log_std_init: float = -0.5
     """连续动作对数标准差初始值"""
 
+    # ── PPO 训练参数 ──
+    ppo_clip_ratio: float = 0.2
+    """PPO clipping ε"""
+
+    ppo_value_coef: float = 0.5
+    """价值损失系数"""
+
+    ppo_entropy_coef: float = 0.01
+    """熵奖励系数"""
+
+    ppo_gamma: float = 0.99
+    """GAE 折扣因子"""
+
+    ppo_lam: float = 0.95
+    """GAE λ"""
+
+    ppo_rollout_steps: int = 32
+    """每次 PPO 更新前收集的 rollout 步数"""
+
+    ppo_epochs: int = 4
+    """每轮数据上进行 PPO 更新的次数"""
+
+    ppo_max_grad_norm: float = 0.5
+    """梯度裁剪阈值"""
+
     def to_dict(self) -> dict:
         return asdict(self)
 

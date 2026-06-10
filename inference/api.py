@@ -74,6 +74,7 @@ class SleepImpactResponse(BaseModel):
 class ControlPolicyRequest(BaseModel):
     """控制策略预测请求。"""
     state_history: list[dict] = Field(..., description="最近 N 条状态记录")
+    deterministic: bool = Field(default=True, description="True=确定性动作, False=随机采样")
 
 
 class ControlPolicyResponse(BaseModel):
@@ -128,17 +129,20 @@ def _postprocess_sleep_impact(predictions: np.ndarray) -> SleepImpactResponse:
     )
 
 
-def _postprocess_control_policy(outputs: dict, deterministic: bool = False) -> ControlPolicyResponse:
-    disc_logits = outputs["discrete_logits"].squeeze(0)  # (3,)
-    cont_mean = outputs["continuous_mean"].squeeze(0)  # (2,)
-    state_val = float(outputs["state_value"].item())
+def _postprocess_control_policy(outputs: dict) -> ControlPolicyResponse:
+    """从 ModelManager 返回的动作字典构建 API 响应。
 
-    disc_action = int(np.argmax(disc_logits))
+    ModelManager.predict_control_policy() 已根据 deterministic 参数
+    完成了 diff(采样)或确定性(deterministic)动作选择，此处直接使用。
+    """
+    disc_action = int(outputs["discrete_action"].item())
+    cont_action = outputs["continuous_action"].squeeze(0)  # (cont_dim,)
+    state_val = float(outputs["state_value"].item())
 
     return ControlPolicyResponse(
         discrete_action=disc_action,
         discrete_action_label=_DISCRETE_ACTION_LABELS[disc_action],
-        continuous_action=[round(float(cont_mean[0]), 4), round(float(cont_mean[1]), 4)],
+        continuous_action=[round(float(v), 4) for v in cont_action],
         state_value=round(state_val, 6),
     )
 
@@ -220,7 +224,9 @@ def create_app(checkpoint_dir: str = "data/checkpoints") -> FastAPI:
     async def predict_control_policy(req: ControlPolicyRequest):
         try:
             state_seq, seq_len = _preprocessor.control_policy(req.state_history)
-            outputs = _model_manager.predict_control_policy(state_seq, seq_len, deterministic=True)
+            outputs = _model_manager.predict_control_policy(
+                state_seq, seq_len, deterministic=req.deterministic
+            )
             return _postprocess_control_policy(outputs)
         except Exception as e:
             logger.exception("control_policy 推理失败")

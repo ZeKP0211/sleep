@@ -274,26 +274,18 @@ def predict_control(
     else:
         seq_lengths = None
 
-    if deterministic:
-        out = model.forward(state_seq, seq_lengths)
-        disc_action = torch.argmax(out["discrete_logits"], dim=-1)
-        cont_action = out["continuous_mean"]
-        state_value = out["state_value"]
-        log_prob = None
-    else:
-        act_out = model.act(state_seq, seq_lengths)
-        disc_action = act_out["discrete_action"]
-        cont_action = act_out["continuous_action"]
-        state_value = act_out["state_value"]
-        log_prob = act_out["log_prob"].cpu().numpy()
+    act_out = model.act(state_seq, seq_lengths, deterministic=deterministic)
+    disc_action = act_out["discrete_action"]
+    cont_action = act_out["continuous_action"]
+    state_value = act_out["state_value"]
 
     result = {
         "discrete_action": disc_action.cpu().numpy(),
         "continuous_action": cont_action.cpu().numpy(),
         "state_value": state_value.cpu().numpy(),
     }
-    if log_prob is not None:
-        result["log_prob"] = log_prob
+    if "log_prob" in act_out:
+        result["log_prob"] = act_out["log_prob"].cpu().numpy()
     return result
 
 

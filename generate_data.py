@@ -140,6 +140,16 @@ def generate_sample_data(num_users: int = 100, days_per_user: int = 30, output_d
                 action_temp_adjust = np.random.normal(0, 1)
                 action_humidity_adjust = np.random.normal(0, 5)
 
+                # 奖励：基于环境质量（温度、湿度、气味等是否在舒适范围内）
+                temp_comfort = 1.0 - min(abs(temp - 23) / 15, 1.0)  # 舒适温度 ~23°C
+                humidity_comfort = 1.0 - min(abs(humidity - 50) / 40, 1.0)  # 舒适湿度 ~50%
+                odor_comfort = 1.0 - odor_intensity if odor_type == '无' else 0.5 * (1.0 - odor_intensity)
+                reward = 0.4 * temp_comfort + 0.3 * humidity_comfort + 0.3 * odor_comfort
+                # 睡眠阶段加权：深睡阶段 (N3=3) 奖励权重更高
+                sleep_weight = 0.8 + 0.2 * (sleep_stage / 3.0)
+                reward *= sleep_weight
+                reward = max(0.0, min(1.0, reward + np.random.normal(0, 0.05)))
+
                 control_data = {
                     'user_id': user_id,
                     'timestamp': timestamp.strftime('%Y-%m-%d %H:%M:%S'),
@@ -150,7 +160,8 @@ def generate_sample_data(num_users: int = 100, days_per_user: int = 30, output_d
                     'time_of_day': time_of_day,
                     'action_discrete': action_discrete,
                     'action_temp_adjust': action_temp_adjust,
-                    'action_humidity_adjust': action_humidity_adjust
+                    'action_humidity_adjust': action_humidity_adjust,
+                    'reward': reward,
                 }
                 all_control_data.append(control_data)
 

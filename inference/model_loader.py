@@ -37,11 +37,27 @@ class ModelManager:
     def __init__(self, model_dir: str):
         self.model_dir = Path(model_dir)
         self._sessions: dict[str, "ort.InferenceSession"] = {}
+        self._preload()
+
+    # ── 预加载 ──
+
+    def _preload(self) -> None:
+        """启动时预加载目录中所有 ONNX 模型，使健康检查立即可用。"""
+        if not _ONNX_AVAILABLE:
+            return
+        for path in sorted(self.model_dir.glob("*.onnx")):
+            model_type = path.stem
+            try:
+                self._sessions[model_type] = ort.InferenceSession(
+                    str(path), providers=["CPUExecutionProvider"]
+                )
+            except Exception:
+                pass
 
     # ── 内部工具 ──
 
     def _get_session(self, model_type: str):
-        """获取或创建 ONNX session。"""
+        """获取或创建 ONNX session（未预加载时按需加载）。"""
         if not _ONNX_AVAILABLE:
             raise RuntimeError("onnxruntime 未安装，请执行 pip install onnxruntime")
 
@@ -58,6 +74,27 @@ class ModelManager:
     def loaded_models(self) -> list[str]:
         """已加载的模型列表。"""
         return list(self._sessions.keys())
+
+    # ── 静态工具：从分布参数计算动作 ──
+
+    @staticmethod
+    def _sample_discrete(logits: np.ndarray) -> np.ndarray:
+        """从 logits 采样离散动作：Categorical.sample()。"""
+        probs = _softmax(logits, axis=-1)
+        cumsum = np.cumsum(probs, axis=-1)
+        r = np.random.uniform(size=probs.shape[:-1] + (1,))
+        return np.argmax(r < cumsum, axis=-1).astype(np.int64)
+
+    @staticmethod
+    def _sample_continuous(mean: np.ndarray, log_std: np.ndarray) -> np.ndarray:
+        """从 Normal(mean, exp(log_std)) 采样连续动作。"""
+        std = np.exp(log_std)
+        return mean + std * np.random.randn(*mean.shape).astype(np.float32)
+
+    @staticmethod
+    def _deterministic_continuous(mean: np.ndarray) -> np.ndarray:
+        """确定性连续动作 = mean。"""
+        return mean.astype(np.float32)
 
     # ── 环境质量 ──
 
@@ -141,16 +178,26 @@ class ModelManager:
         seq_lengths: Optional[np.ndarray] = None,
         deterministic: bool = False,
     ) -> dict[str, np.ndarray]:
-        """控制策略预测。
+        """控制策略预测：从 ONNX forward 输出计算动作。
+
+        模型导出时仅包含 forward()（logits / mean / log_std / value），
+        采样逻辑在此处实现，与 PyTorch 版本完全对齐。
 
         Args:
-            state_seq: (1, seq_len, state_dim) float32，维度由导出时模型配置决定
+            state_seq: (1, seq_len, state_dim) float32
             seq_lengths: (1,) int64 或 None
-            deterministic: True 时返回 argmax 离散动作 + 均值连续动作
+            deterministic: True → argmax 离散 + mean 连续
+                          False → Categorical.sample() + Normal.sample()
 
         Returns:
-            {"discrete_logits": ..., "continuous_mean": ..., "continuous_log_std": ..., "state_value": ...}
-            各输出维度由导出时模型配置决定
+            {
+                "discrete_action": (1,) int64,
+                "continuous_action": (1, cont_dim) float32,
+                "state_value": (1,) float32,
+                "discrete_logits": (1, disc_dim) float32,
+                "continuous_mean": (1, cont_dim) float32,
+                "continuous_log_std": (1, cont_dim) float32,
+            }
         """
         session = self._get_session("control_policy")
         if state_seq.ndim == 2:
@@ -158,14 +205,45 @@ class ModelManager:
         if seq_lengths is not None and seq_lengths.ndim == 0:
             seq_lengths = seq_lengths.reshape(1)
 
-        feed = {"state_seq": state_seq.astype(np.float32)}
-        if seq_lengths is not None:
-            feed["seq_lengths"] = seq_lengths.astype(np.int64)
+        seq_len = state_seq.shape[1] if state_seq.ndim == 3 else state_seq.shape[0]
+        if seq_lengths is None:
+            seq_lengths = np.array([seq_len], dtype=np.int64)
+        elif seq_lengths.ndim == 0:
+            seq_lengths = seq_lengths.reshape(1)
+
+        feed = {
+            "state_seq": state_seq.astype(np.float32),
+            "seq_lengths": seq_lengths.astype(np.int64),
+        }
 
         outputs = session.run(None, feed)
+        discrete_logits = outputs[0]       # (1, discrete_action_dim)
+        continuous_mean = outputs[1]       # (1, continuous_action_dim)
+        continuous_log_std = outputs[2]    # (1, continuous_action_dim)
+        state_value = outputs[3]           # (1,)
+
+        # ── 动作选择 ──
+        if deterministic:
+            discrete_action = np.argmax(discrete_logits, axis=-1).astype(np.int64)
+            continuous_action = self._deterministic_continuous(continuous_mean)
+        else:
+            discrete_action = self._sample_discrete(discrete_logits)
+            continuous_action = self._sample_continuous(continuous_mean, continuous_log_std)
+
         return {
-            "discrete_logits": outputs[0],
-            "continuous_mean": outputs[1],
-            "continuous_log_std": outputs[2],
-            "state_value": outputs[3],
+            "discrete_action": discrete_action,
+            "continuous_action": continuous_action,
+            "state_value": state_value,
+            "discrete_logits": discrete_logits,
+            "continuous_mean": continuous_mean,
+            "continuous_log_std": continuous_log_std,
         }
+
+
+# ── 独立工具函数 ──
+
+def _softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
+    """稳定 softmax 实现。"""
+    x_max = np.max(x, axis=axis, keepdims=True)
+    e_x = np.exp(x - x_max)
+    return e_x / np.sum(e_x, axis=axis, keepdims=True)
